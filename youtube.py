@@ -13,6 +13,13 @@ from joblib import dump, load
 import streamlit as st
 import shap
 
+# Try to import ollama, but make it optional
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
 # ───── Configuration ─────────────────────────────────────────────────────────
 
 RAW_PATH = Path("data/raw")
@@ -56,7 +63,7 @@ def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
     # Use a fixed upload hour (placeholder)
     df["upload_hour"] = 17
 
-    # Rename columns so they match our model’s expected feature names
+    # Rename columns so they match our model's expected feature names
     df.rename(
         columns={
             "Views": "views_7d",
@@ -108,6 +115,86 @@ def cli_train():
     except FileNotFoundError as e:
         print(f"⚠️  {e}")
 
+# ───── AI Explanation with Llama ─────────────────────────────────────────────
+def explain_with_llama(model, X_row: pd.DataFrame, title_input: str) -> str:
+    """
+    Generate an AI-powered explanation using Llama for why the video will get these views.
+    """
+    if not OLLAMA_AVAILABLE:
+        return "❌ **Ollama not installed**\n\nTo use AI explanations, install Ollama:\n```bash\npip install ollama\n```\n\nThen download a model:\n```bash\nollama pull llama2\n```"
+    
+    # Get prediction and SHAP values
+    pred_value = model.predict(X_row)[0]
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_row)[0]
+    
+    # Extract feature values
+    title_len = int(X_row["title_len"].iloc[0])
+    emoji_cnt = int(X_row["emoji_cnt"].iloc[0])
+    upload_hour = int(X_row["upload_hour"].iloc[0])
+    impressions = int(X_row["impressions"].iloc[0])
+    ctr = float(X_row["ctr"].iloc[0])
+    subs = int(X_row["subs_at_upload"].iloc[0])
+    
+    # Get SHAP values for each feature
+    feature_impacts = dict(zip(FEATURES, shap_values))
+    
+    # Create prompt for Llama
+    prompt = f"""You are a YouTube analytics expert. Analyze this video prediction and explain why it will get {pred_value:.0f} views in the first week.
+
+VIDEO DETAILS:
+Title: "{title_input}"
+- Title length: {title_len} characters
+- Emojis used: {emoji_cnt}
+- Upload time: {upload_hour}:00
+- Expected impressions: {impressions:,}
+- Target CTR: {ctr}%
+- Current subscribers: {subs:,}
+
+FEATURE IMPACT ANALYSIS:
+- Title length impact: {feature_impacts['title_len']:.0f} views
+- Emoji impact: {feature_impacts['emoji_cnt']:.0f} views  
+- Upload time impact: {feature_impacts['upload_hour']:.0f} views
+- Impressions impact: {feature_impacts['impressions']:.0f} views
+- CTR impact: {feature_impacts['ctr']:.0f} views
+- Subscriber impact: {feature_impacts['subs_at_upload']:.0f} views
+
+TASK: Provide a detailed, professional analysis explaining:
+1. Why this video will perform at this level
+2. Which factors are helping/hurting performance most
+3. Specific actionable recommendations for improvement
+4. Industry context and benchmarks
+
+Keep it engaging but professional, like a YouTube consultant's report. Use markdown formatting with headers and bullet points."""
+    
+    try:
+        # Simplified approach - just try to use llama3.2 first, then llama2
+        model_name = "llama3.2:latest"
+        
+        try:
+            # Try llama3.2 first
+            response = ollama.chat(model=model_name, messages=[
+                {'role': 'user', 'content': prompt}
+            ])
+        except:
+            # If that fails, try llama2
+            model_name = "llama2:latest"
+            response = ollama.chat(model=model_name, messages=[
+                {'role': 'user', 'content': prompt}
+            ])
+        
+        ai_response = response.get('message', {}).get('content', 'No response received')
+        
+        # Add header with model info
+        header = f"🤖 **AI Analysis** (using {model_name})\n\n"
+        return header + ai_response
+        
+    except Exception as e:
+        # Fallback to simple explanation
+        error_msg = f"❌ **AI analysis failed**: {str(e)}\n\n"
+        error_msg += "**Falling back to simple explanation:**\n\n"
+        return error_msg + explain_simple(model, X_row)
+
 # ───── Helper: Simple Explanation ────────────────────────────────────────────
 
 def explain_simple(model, X_row: pd.DataFrame) -> str:
@@ -116,7 +203,7 @@ def explain_simple(model, X_row: pd.DataFrame) -> str:
     - States the base guess (if no features).
     - Describes how each detail (title length, CTR, etc.) raised or lowered the guess,
       using simple sentences.
-    - Ends with very simple advice (“shorten your title,” “keep using emojis,” etc.).
+    - Ends with very simple advice ("shorten your title," "keep using emojis," etc.).
     """
     # Compute raw prediction and SHAP values
     pred_value = model.predict(X_row)[0]
@@ -181,7 +268,7 @@ def explain_simple(model, X_row: pd.DataFrame) -> str:
     else:
         lines.append(
             f"Since you have {imp} impressions, I add {imp_shap:.0f} views. "
-            "That’s good exposure."
+            "That's good exposure."
         )
 
     # Emoji count effect
@@ -232,15 +319,15 @@ def explain_simple(model, X_row: pd.DataFrame) -> str:
     lines.append("Here are some simple tips you can follow:")
     # Tip: shorten or lengthen title
     if tl < 20:
-        lines.append(" • Your title is quite short. Try making it a bit longer so people know what it’s about.")
+        lines.append(" • Your title is quite short. Try making it a bit longer so people know what it's about.")
     elif tl > 60:
-        lines.append(" • Your title is very long. Try shortening it so it’s easier to read.")
+        lines.append(" • Your title is very long. Try shortening it so it's easier to read.")
     else:
         lines.append(" • Your title length is okay.")
 
     # Tip: emojis
     if ec == 0:
-        lines.append(" • You didn’t use any emoji. Adding one could catch people’s eye.")
+        lines.append(" • You didn't use any emoji. Adding one could catch people's eye.")
     elif ec > 3:
         lines.append(" • You used a lot of emojis. Maybe limit to one or two to keep it clear.")
     else:
@@ -281,6 +368,12 @@ def load_model():
 def streamlit_app():
     st.set_page_config(page_title="YouTube Video Analyzer", layout="wide")
     st.title("📊 YouTube Video Analyzer")
+    
+    # Add info about AI features
+    if OLLAMA_AVAILABLE:
+        st.success("🤖 AI analysis available via Ollama")
+    else:
+        st.warning("⚠️ AI analysis not available. Install ollama: `pip install ollama`")
 
     # Sidebar: Train / Retrain the model
     if st.sidebar.button("Train / retrain model"):
@@ -288,26 +381,64 @@ def streamlit_app():
             try:
                 r2 = train_and_save()
                 st.sidebar.success(f"Model trained (R² = {r2:.3f})")
-                st.experimental_rerun()
+                # Removed st.experimental_rerun() for compatibility
             except FileNotFoundError as e:
                 st.sidebar.error(str(e))
+
+    # Sidebar: AI Setup Instructions
+    with st.sidebar.expander("🤖 AI Setup Instructions"):
+        st.markdown("""
+        **To enable AI explanations:**
+        
+        1. Install Ollama:
+        ```bash
+        pip install ollama
+        ```
+        
+        2. Start Ollama service:
+        ```bash
+        ollama serve
+        ```
+        
+        3. Download a model:
+        ```bash
+        ollama pull llama2
+        ```
+        
+        4. Restart this app
+        """)
 
     # Load the model (if it exists)
     model, feat_cols = load_model()
 
     # Input form
-    title_input = st.text_input("Video title (so we can count characters and emojis)")
-    upload_hour_input = st.slider("Planned upload hour (0 – 23)", 0, 23, 17)
-    impressions_input = st.number_input(
-        "Expected first-day impressions", min_value=0, step=100, value=1000
-    )
-    ctr_input = st.slider("Target CTR (%)", 0.0, 20.0, 4.5, 0.1)
-    subs_input = st.number_input(
-        "Current subscribers", min_value=0, step=100, value=5000
-    )
+    st.subheader("📝 Enter Your Video Details")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        title_input = st.text_input(
+            "Video title (so we can count characters and emojis)",
+            placeholder="My Amazing YouTube Video! 🔥"
+        )
+        upload_hour_input = st.slider("Planned upload hour (0 – 23)", 0, 23, 17)
+        impressions_input = st.number_input(
+            "Expected first-day impressions", min_value=0, step=100, value=1000
+        )
+    
+    with col2:
+        ctr_input = st.slider("Target CTR (%)", 0.0, 20.0, 4.5, 0.1)
+        subs_input = st.number_input(
+            "Current subscribers", min_value=0, step=100, value=90
+        )
+        
+        # Show title stats
+        if title_input:
+            emoji_count = sum(1 for c in title_input if not c.isalnum() and not c.isspace())
+            st.info(f"Title length: {len(title_input)} characters\nEmojis detected: {emoji_count}")
 
-    # Predict button
-    if st.button("Predict & Explain"):
+    # Predict button (removed type="primary" for compatibility)
+    if st.button("🚀 Predict & Explain"):
         # Ensure the model is trained
         if model is None:
             st.error("No model found. Please train the model first via the sidebar.")
@@ -327,17 +458,33 @@ def streamlit_app():
             }
         ])
 
-        # Get the friendly explanation
-        explanation_text = explain_simple(model, X_new)
-
-        # Display the text as markdown
-        st.markdown(explanation_text)
+        # Show prediction first
+        prediction = model.predict(X_new)[0]
+        st.subheader(f"📈 Predicted Views: {prediction:,.0f}")
+        
+        # Create tabs for different explanation types
+        if OLLAMA_AVAILABLE:
+            tab1, tab2 = st.tabs(["🤖 AI Analysis", "📊 Simple Explanation"])
+            
+            with tab1:
+                with st.spinner("Getting AI analysis... (this may take 30-60 seconds)"):
+                    ai_explanation = explain_with_llama(model, X_new, title_input)
+                    st.markdown(ai_explanation)
+            
+            with tab2:
+                simple_explanation = explain_simple(model, X_new)
+                st.markdown(simple_explanation)
+        else:
+            # Only show simple explanation if AI not available
+            st.subheader("📊 Explanation")
+            simple_explanation = explain_simple(model, X_new)
+            st.markdown(simple_explanation)
 
 # ───── Entry Point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    parser.add_argument( 
         "--train", action="store_true",
         help="Train or retrain the model and exit"
     )
